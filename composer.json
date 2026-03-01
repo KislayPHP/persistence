@@ -1,0 +1,39 @@
+{
+    "name": "kislayphp/persistence",
+    "description": "Request-safe persistence runtime for KislayPHP (transaction guard + bounded cache)",
+    "type": "php-ext",
+    "license": "Apache-2.0",
+    "keywords": [
+        "php",
+        "microservices",
+        "php-extension",
+        "cpp-extension",
+        "pdo",
+        "transaction-guard",
+        "request-lifecycle",
+        "cache",
+        "kislayphp"
+    ],
+    "homepage": "https://github.com/KislayPHP/persistence",
+    "authors": [
+        {
+            "name": "KislayPHP Team",
+            "email": "team@kislayphp.com"
+        }
+    ],
+    "require": {
+        "php": ">=8.2",
+        "kislayphp/core": ">=0.0.3"
+    },
+    "provide": {
+        "ext-kislayphp_persistence": "*"
+    },
+    "support": {
+        "issues": "https://github.com/KislayPHP/persistence/issues",
+        "source": "https://github.com/KislayPHP/persistence"
+    },
+    "php-ext": {
+        "extension-name": "kislayphp_persistence",
+        "configure-options": []
+    }
+}
