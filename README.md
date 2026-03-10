@@ -1,94 +1,112 @@
-# Kislay Persistence
+# KislayPHP Persistence
 
-Request-safe persistence runtime for long-lived KislayPHP servers.
+[![PHP Version](https://img.shields.io/badge/PHP-8.2%2B-blue.svg)](https://php.net)
+[![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/KislayPHP/persistence/ci.yml?branch=main&label=CI)](https://github.com/KislayPHP/persistence/actions)
+[![PIE](https://img.shields.io/badge/install-pie-blueviolet)](https://github.com/php/pie)
 
-## Concurrency Mode
+> **Per-request data persistence lifecycle for PHP microservices.** Automatic transaction management when attached to a `kislayphp/core` App — begin on request start, commit or rollback on request end.
 
-- Default API mode is synchronous.
-- Database and transaction operations are request-scoped and deterministic by design.
-- This module should remain sync-first; async behavior belongs in core/gateway/eventbus and async HTTP clients.
+Part of the [KislayPHP ecosystem](https://skelves.com/kislayphp/docs).
 
-## Why this extension
+---
 
-Persistent servers keep PHP objects alive across requests. This extension hardens two common failure modes:
+## ✨ What It Does
 
-- Unclosed DB transactions leaking between requests
-- Unbounded static in-memory caches
+`kislayphp/persistence` provides a persistence runtime that integrates with `kislayphp/core`'s request lifecycle hooks. Attach it to your App and every request gets automatic transaction management — begin on start, commit on success, rollback on exception.
 
-It is designed to be attached once to `Kislay\Core\App`; after that, cleanup is automatic on each request.
-
-## Install
-
-```bash
-pie install kislayphp/persistence:0.0.1
+```php
+<?php
+Kislay\Persistence\Runtime::attach($app);  // that's it
 ```
 
-Add to `php.ini`:
+Every request now has a clean transaction scope. No manual begin/commit/rollback per handler.
 
+---
+
+## 📦 Installation
+
+```bash
+pie install kislayphp/persistence
+```
+
+Enable in `php.ini`:
 ```ini
 extension=kislayphp_persistence.so
 ```
 
-## Usage (C++ facades)
+---
+
+## 🚀 Quick Start
+
+### Automatic Transaction Per Request
 
 ```php
 <?php
-
 $app = new Kislay\Core\App();
-$config = require __DIR__ . '/config/app.php';
 
-Kislay\Persistence\DB::boot($config['database']);
-Kislay\Persistence\DB::attach($app);
+// Attach persistence — handles begin/commit/rollback per request automatically
+Kislay\Persistence\Runtime::attach($app);
 
-$app->post('/users', function ($req, $res) {
-    $user = Kislay\Persistence\DB::transaction(function (PDO $db) use ($req) {
-        $payload = $req->getJson() ?? [];
-        $stmt = $db->prepare('INSERT INTO users(name,email) VALUES(:name,:email)');
-        $stmt->execute([
-            ':name' => $payload['name'] ?? 'unknown',
-            ':email' => $payload['email'] ?? 'unknown@example.com',
-        ]);
+$app->post('/api/orders', function($req, $res) {
+    $data = $req->getJson();
 
-        return [
-            'id' => (int) $db->lastInsertId(),
-            'name' => $payload['name'] ?? 'unknown'
-        ];
-    });
+    // Transaction is already open — just write your business logic
+    $orderId = DB::create('orders', $data);
+    Inventory::decrement($data['product_id'], $data['qty']);
+    Email::queue('order_confirmation', $data['email']);
 
-    $res->json($user, 201);
+    $res->json(['order_id' => $orderId], 201);
+    // Transaction commits automatically on clean return
+    // Transaction rolls back automatically on exception
 });
+
+$app->listen('0.0.0.0', 8080);
 ```
 
-## API
+### Manual Usage
 
-`Kislay\Persistence\DB`:
-- `boot(array $databaseConfig): bool`
-- `connection(?string $name = null): PDO`
-- `connect(?string $name = null): PDO`
-- `transaction(callable $callback, ?string $connection = null): mixed`
-- `attach(Kislay\Core\App $app): bool`
-- `cleanup(): int`
+```php
+<?php
+$persistence = new Kislay\Persistence\Runtime();
 
-`Kislay\Persistence\Eloquent`:
-- `boot(array $databaseConfig): bool`
-- `connection(?string $name = null): PDO`
-- `transaction(callable $callback, ?string $connection = null): mixed`
-- `attach(Kislay\Core\App $app): bool`
+$persistence->begin();
 
-`Kislay\Persistence\Runtime`:
-- `attach(Kislay\Core\App $app): bool`
-- `track(object $pdo): bool`
-- `transaction(object $pdo, callable $callback): mixed`
-- `beginRequest(): void`
-- `cleanup(): int`
-- `cachePut(string $pool, string $key, mixed $value, ?int $ttlSeconds = null): bool`
-- `cacheGet(string $pool, string $key, mixed $default = null): mixed`
-- `cacheForget(string $pool, string $key): bool`
-- `cacheClear(?string $pool = null): int`
-- `setCacheLimits(int $maxEntriesPerPool, int $defaultTtlSeconds): bool`
+try {
+    $id = DB::insert('users', $data);
+    Log::write('user_created', $id);
+    $persistence->commit();
+} catch (\Throwable $e) {
+    $persistence->rollback();
+    throw $e;
+}
+```
 
-## Notes
+---
 
-- Cache is in-process memory; use Redis/Memcached for distributed cache.
-- `attach()` requires Core versions that expose `onRequestStart` and `onRequestEnd`.
-- `DB::boot()` expects Laravel-style config shape: `default` + `connections`.
+## 📖 Public API
+
+```php
+namespace Kislay\Persistence;
+
+class Runtime {
+    public function __construct();
+    public static function attach(Kislay\Core\App $app): void;  // per-request auto lifecycle
+    public function begin(): bool;
+    public function commit(): bool;
+    public function rollback(): bool;
+    public function isActive(): bool;
+}
+```
+
+Legacy aliases: `KislayPHP\Persistence\Runtime`
+
+---
+
+## 🔗 Ecosystem
+
+[core](https://github.com/KislayPHP/core) · [gateway](https://github.com/KislayPHP/gateway) · [discovery](https://github.com/KislayPHP/discovery) · [metrics](https://github.com/KislayPHP/metrics) · [queue](https://github.com/KislayPHP/queue) · [eventbus](https://github.com/KislayPHP/eventbus) · **persistence**
+
+## 📄 License
+
+[Apache License 2.0](LICENSE) · **[Full Docs](https://skelves.com/kislayphp/docs)**
