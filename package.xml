@@ -16,15 +16,15 @@
   </lead>
   <date>2026-03-01</date>
   <version>
-    <release>0.0.1</release>
-    <api>0.0.1</api>
+    <release>0.0.2</release>
+    <api>0.0.2</api>
   </version>
   <stability>
     <release>beta</release>
     <api>beta</api>
   </stability>
   <license>Apache-2.0</license>
-  <notes>Initial release: C++ DB/Eloquent facades, connection config + cache, request lifecycle transaction guard, bounded cache runtime, and PIE-safe get_module export.</notes>
+  <notes>Release 0.0.2.</notes>
   <contents>
     <dir name="/">
       <file name="config.m4" role="src" />

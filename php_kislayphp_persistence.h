@@ -5,7 +5,7 @@ extern "C" {
 #include "php.h"
 }
 
-#define PHP_KISLAYPHP_PERSISTENCE_VERSION "0.0.1"
+#define PHP_KISLAYPHP_PERSISTENCE_VERSION "0.0.2"
 #define PHP_KISLAYPHP_PERSISTENCE_EXTNAME "kislayphp_persistence"
 
 extern zend_module_entry kislayphp_persistence_module_entry;

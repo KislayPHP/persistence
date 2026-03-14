@@ -102,6 +102,44 @@ static inline int kislayphp_object_init_with_constructor(
 static zend_class_entry *kislayphp_persistence_runtime_ce;
 static zend_class_entry *kislayphp_persistence_db_ce;
 static zend_class_entry *kislayphp_persistence_eloquent_ce;
+static zend_class_entry *kislayphp_persistence_migrations_ce;
+
+struct kislayphp_migration_entry {
+    std::string id;
+    std::string sql;
+};
+
+typedef struct _php_kislayphp_migrations_t {
+    std::vector<kislayphp_migration_entry> migrations;
+    std::string connection_name;
+    bool has_connection_name;
+    zend_object std;
+} php_kislayphp_migrations_t;
+
+static zend_object_handlers kislayphp_migrations_object_handlers;
+
+static inline php_kislayphp_migrations_t *php_kislayphp_migrations_fetch_object(zend_object *obj) {
+    return (php_kislayphp_migrations_t *) ((char *)(obj) - offsetof(php_kislayphp_migrations_t, std));
+}
+
+static zend_object *kislayphp_migrations_create_object(zend_class_entry *ce) {
+    php_kislayphp_migrations_t *obj = (php_kislayphp_migrations_t *)
+        zend_object_alloc(sizeof(php_kislayphp_migrations_t), ce);
+    new (&obj->migrations) std::vector<kislayphp_migration_entry>();
+    new (&obj->connection_name) std::string();
+    obj->has_connection_name = false;
+    zend_object_std_init(&obj->std, ce);
+    object_properties_init(&obj->std, ce);
+    obj->std.handlers = &kislayphp_migrations_object_handlers;
+    return &obj->std;
+}
+
+static void kislayphp_migrations_free_object(zend_object *object) {
+    php_kislayphp_migrations_t *obj = php_kislayphp_migrations_fetch_object(object);
+    obj->migrations.~vector();
+    obj->connection_name.~basic_string();
+    zend_object_std_dtor(object);
+}
 
 struct CacheEntry {
     zval value;
@@ -737,6 +775,78 @@ static bool kislayphp_db_connection(char *name, size_t name_len, zval *return_va
     return true;
 }
 
+static bool kislayphp_pdo_prepare_execute(
+    zval *pdo,
+    const char *sql,
+    size_t sql_len,
+    zval *bindings,
+    zval *stmt_out,
+    std::string *error_out
+) {
+    ZVAL_UNDEF(stmt_out);
+    zval sql_zv;
+    ZVAL_STRINGL(&sql_zv, sql, sql_len);
+    zend_call_method_with_1_params(Z_OBJ_P(pdo), Z_OBJCE_P(pdo), nullptr, "prepare", stmt_out, &sql_zv);
+    zval_ptr_dtor(&sql_zv);
+    if (EG(exception) != nullptr) {
+        if (error_out) *error_out = "PDO::prepare() failed";
+        return false;
+    }
+    if (Z_TYPE_P(stmt_out) == IS_FALSE || Z_TYPE_P(stmt_out) == IS_UNDEF) {
+        if (error_out) *error_out = "PDO::prepare() returned false";
+        return false;
+    }
+    zval bindings_zv;
+    if (bindings != nullptr && Z_TYPE_P(bindings) == IS_ARRAY) {
+        ZVAL_COPY(&bindings_zv, bindings);
+    } else {
+        array_init(&bindings_zv);
+    }
+    zval exec_ret;
+    ZVAL_UNDEF(&exec_ret);
+    zend_call_method_with_1_params(Z_OBJ_P(stmt_out), Z_OBJCE_P(stmt_out), nullptr, "execute", &exec_ret, &bindings_zv);
+    zval_ptr_dtor(&bindings_zv);
+    if (EG(exception) != nullptr) {
+        if (error_out) *error_out = "PDOStatement::execute() failed";
+        zval_ptr_dtor(stmt_out);
+        ZVAL_UNDEF(stmt_out);
+        zval_ptr_dtor(&exec_ret);
+        return false;
+    }
+    if (Z_TYPE(exec_ret) == IS_FALSE) {
+        if (error_out) *error_out = "PDOStatement::execute() returned false";
+        zval_ptr_dtor(stmt_out);
+        ZVAL_UNDEF(stmt_out);
+        zval_ptr_dtor(&exec_ret);
+        return false;
+    }
+    zval_ptr_dtor(&exec_ret);
+    return true;
+}
+
+static bool kislayphp_migrations_ensure_table(zval *pdo, std::string *error_out) {
+    const char *create_sql =
+        "CREATE TABLE IF NOT EXISTS _kislay_migrations "
+        "(id VARCHAR(255) PRIMARY KEY, run_at DATETIME DEFAULT CURRENT_TIMESTAMP)";
+    zval sql_zv, exec_ret;
+    ZVAL_STRING(&sql_zv, create_sql);
+    ZVAL_UNDEF(&exec_ret);
+    zend_call_method_with_1_params(Z_OBJ_P(pdo), Z_OBJCE_P(pdo), nullptr, "exec", &exec_ret, &sql_zv);
+    zval_ptr_dtor(&sql_zv);
+    if (EG(exception) != nullptr) {
+        if (error_out) *error_out = "Failed to create _kislay_migrations table";
+        zval_ptr_dtor(&exec_ret);
+        return false;
+    }
+    if (Z_TYPE(exec_ret) == IS_FALSE) {
+        if (error_out) *error_out = "Failed to create _kislay_migrations table";
+        zval_ptr_dtor(&exec_ret);
+        return false;
+    }
+    zval_ptr_dtor(&exec_ret);
+    return true;
+}
+
 PHP_METHOD(KislayPersistenceRuntime, attach) {
     zval *app = nullptr;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -786,13 +896,33 @@ PHP_METHOD(KislayPersistenceRuntime, transaction) {
 }
 
 PHP_METHOD(KislayPersistenceRuntime, beginRequest) {
-    ZEND_PARSE_PARAMETERS_NONE();
+    zval *arg1 = nullptr;
+    zval *arg2 = nullptr;
+    zval *arg3 = nullptr;
+
+    ZEND_PARSE_PARAMETERS_START(0, 3)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ZVAL(arg1)
+        Z_PARAM_ZVAL(arg2)
+        Z_PARAM_ZVAL(arg3)
+    ZEND_PARSE_PARAMETERS_END();
+
     kislayphp_begin_request();
     RETURN_NULL();
 }
 
 PHP_METHOD(KislayPersistenceRuntime, cleanup) {
-    ZEND_PARSE_PARAMETERS_NONE();
+    zval *arg1 = nullptr;
+    zval *arg2 = nullptr;
+    zval *arg3 = nullptr;
+
+    ZEND_PARSE_PARAMETERS_START(0, 3)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ZVAL(arg1)
+        Z_PARAM_ZVAL(arg2)
+        Z_PARAM_ZVAL(arg3)
+    ZEND_PARSE_PARAMETERS_END();
+
     RETURN_LONG(kislayphp_cleanup_transactions());
 }
 
@@ -1099,6 +1229,430 @@ PHP_METHOD(KislayPersistenceDB, cleanup) {
     RETURN_LONG(kislayphp_cleanup_transactions());
 }
 
+PHP_METHOD(KislayPersistenceDB, select) {
+    char *sql = nullptr; size_t sql_len = 0;
+    zval *bindings = nullptr;
+    char *conn_name = nullptr; size_t conn_name_len = 0;
+
+    ZEND_PARSE_PARAMETERS_START(1, 3)
+        Z_PARAM_STRING(sql, sql_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_OR_NULL(bindings)
+        Z_PARAM_STRING_OR_NULL(conn_name, conn_name_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    zval pdo;
+    ZVAL_UNDEF(&pdo);
+    std::string error;
+    if (!kislayphp_db_connection(conn_name, conn_name_len, &pdo, &error)) {
+        if (EG(exception) == nullptr) zend_throw_exception(zend_ce_exception, error.c_str(), 0);
+        array_init(return_value);
+        return;
+    }
+
+    zval stmt;
+    if (!kislayphp_pdo_prepare_execute(&pdo, sql, sql_len, bindings, &stmt, &error)) {
+        zval_ptr_dtor(&pdo);
+        if (EG(exception) == nullptr) zend_throw_exception(zend_ce_exception, error.c_str(), 0);
+        array_init(return_value);
+        return;
+    }
+    zval_ptr_dtor(&pdo);
+
+    zval fetch_mode;
+    ZVAL_LONG(&fetch_mode, 2); // PDO::FETCH_ASSOC
+    zval fetch_ret;
+    ZVAL_UNDEF(&fetch_ret);
+    zend_call_method_with_1_params(Z_OBJ(stmt), Z_OBJCE(stmt), nullptr, "fetchAll", &fetch_ret, &fetch_mode);
+    zval_ptr_dtor(&stmt);
+
+    if (EG(exception) != nullptr || Z_TYPE(fetch_ret) != IS_ARRAY) {
+        zval_ptr_dtor(&fetch_ret);
+        array_init(return_value);
+        return;
+    }
+    RETURN_ZVAL(&fetch_ret, 0, 0);
+}
+
+PHP_METHOD(KislayPersistenceDB, insert) {
+    char *sql = nullptr; size_t sql_len = 0;
+    zval *bindings = nullptr;
+    char *conn_name = nullptr; size_t conn_name_len = 0;
+
+    ZEND_PARSE_PARAMETERS_START(1, 3)
+        Z_PARAM_STRING(sql, sql_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_OR_NULL(bindings)
+        Z_PARAM_STRING_OR_NULL(conn_name, conn_name_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    zval pdo;
+    ZVAL_UNDEF(&pdo);
+    std::string error;
+    if (!kislayphp_db_connection(conn_name, conn_name_len, &pdo, &error)) {
+        if (EG(exception) == nullptr) zend_throw_exception(zend_ce_exception, error.c_str(), 0);
+        RETURN_LONG(0);
+    }
+
+    zval stmt;
+    if (!kislayphp_pdo_prepare_execute(&pdo, sql, sql_len, bindings, &stmt, &error)) {
+        zval_ptr_dtor(&pdo);
+        if (EG(exception) == nullptr) zend_throw_exception(zend_ce_exception, error.c_str(), 0);
+        RETURN_LONG(0);
+    }
+    zval_ptr_dtor(&stmt);
+
+    zval last_id;
+    ZVAL_UNDEF(&last_id);
+    zend_call_method_with_0_params(Z_OBJ(pdo), Z_OBJCE(pdo), nullptr, "lastInsertId", &last_id);
+    zval_ptr_dtor(&pdo);
+
+    if (EG(exception) != nullptr || Z_TYPE(last_id) == IS_UNDEF) {
+        zval_ptr_dtor(&last_id);
+        RETURN_LONG(0);
+    }
+    zend_long id = zval_get_long(&last_id);
+    zval_ptr_dtor(&last_id);
+    RETURN_LONG(id);
+}
+
+PHP_METHOD(KislayPersistenceDB, update) {
+    char *sql = nullptr; size_t sql_len = 0;
+    zval *bindings = nullptr;
+    char *conn_name = nullptr; size_t conn_name_len = 0;
+
+    ZEND_PARSE_PARAMETERS_START(1, 3)
+        Z_PARAM_STRING(sql, sql_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_OR_NULL(bindings)
+        Z_PARAM_STRING_OR_NULL(conn_name, conn_name_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    zval pdo;
+    ZVAL_UNDEF(&pdo);
+    std::string error;
+    if (!kislayphp_db_connection(conn_name, conn_name_len, &pdo, &error)) {
+        if (EG(exception) == nullptr) zend_throw_exception(zend_ce_exception, error.c_str(), 0);
+        RETURN_LONG(0);
+    }
+
+    zval stmt;
+    if (!kislayphp_pdo_prepare_execute(&pdo, sql, sql_len, bindings, &stmt, &error)) {
+        zval_ptr_dtor(&pdo);
+        if (EG(exception) == nullptr) zend_throw_exception(zend_ce_exception, error.c_str(), 0);
+        RETURN_LONG(0);
+    }
+    zval_ptr_dtor(&pdo);
+
+    zval row_count;
+    ZVAL_UNDEF(&row_count);
+    zend_call_method_with_0_params(Z_OBJ(stmt), Z_OBJCE(stmt), nullptr, "rowCount", &row_count);
+    zval_ptr_dtor(&stmt);
+
+    if (EG(exception) != nullptr || Z_TYPE(row_count) == IS_UNDEF) {
+        zval_ptr_dtor(&row_count);
+        RETURN_LONG(0);
+    }
+    zend_long count = zval_get_long(&row_count);
+    zval_ptr_dtor(&row_count);
+    RETURN_LONG(count);
+}
+
+PHP_METHOD(KislayPersistenceDB, delete) {
+    char *sql = nullptr; size_t sql_len = 0;
+    zval *bindings = nullptr;
+    char *conn_name = nullptr; size_t conn_name_len = 0;
+
+    ZEND_PARSE_PARAMETERS_START(1, 3)
+        Z_PARAM_STRING(sql, sql_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_OR_NULL(bindings)
+        Z_PARAM_STRING_OR_NULL(conn_name, conn_name_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    zval pdo;
+    ZVAL_UNDEF(&pdo);
+    std::string error;
+    if (!kislayphp_db_connection(conn_name, conn_name_len, &pdo, &error)) {
+        if (EG(exception) == nullptr) zend_throw_exception(zend_ce_exception, error.c_str(), 0);
+        RETURN_LONG(0);
+    }
+
+    zval stmt;
+    if (!kislayphp_pdo_prepare_execute(&pdo, sql, sql_len, bindings, &stmt, &error)) {
+        zval_ptr_dtor(&pdo);
+        if (EG(exception) == nullptr) zend_throw_exception(zend_ce_exception, error.c_str(), 0);
+        RETURN_LONG(0);
+    }
+    zval_ptr_dtor(&pdo);
+
+    zval row_count;
+    ZVAL_UNDEF(&row_count);
+    zend_call_method_with_0_params(Z_OBJ(stmt), Z_OBJCE(stmt), nullptr, "rowCount", &row_count);
+    zval_ptr_dtor(&stmt);
+
+    if (EG(exception) != nullptr || Z_TYPE(row_count) == IS_UNDEF) {
+        zval_ptr_dtor(&row_count);
+        RETURN_LONG(0);
+    }
+    zend_long count = zval_get_long(&row_count);
+    zval_ptr_dtor(&row_count);
+    RETURN_LONG(count);
+}
+
+PHP_METHOD(KislayPersistenceDB, ping) {
+    char *name = nullptr; size_t name_len = 0;
+    zend_bool name_is_null = 1;
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_STRING_OR_NULL(name, name_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    zval pdo;
+    ZVAL_UNDEF(&pdo);
+    std::string error;
+
+    if (!kislayphp_db_connection(name, name_len, &pdo, &error)) {
+        RETURN_FALSE;
+    }
+    if (Z_TYPE(pdo) != IS_OBJECT) {
+        zval_ptr_dtor(&pdo);
+        RETURN_FALSE;
+    }
+
+    zval query_str, query_result;
+    ZVAL_STRING(&query_str, "SELECT 1");
+    ZVAL_UNDEF(&query_result);
+
+    zend_call_method_with_1_params(Z_OBJ(pdo), Z_OBJCE(pdo), nullptr, "query", &query_result, &query_str);
+    zval_ptr_dtor(&query_str);
+
+    bool ok = !EG(exception) && Z_TYPE(query_result) != IS_FALSE && Z_TYPE(query_result) != IS_UNDEF;
+    if (EG(exception)) {
+        zend_clear_exception();
+    }
+    zval_ptr_dtor(&query_result);
+    zval_ptr_dtor(&pdo);
+
+    RETURN_BOOL(ok);
+}
+
+PHP_METHOD(KislayPersistenceMigrations, __construct) {
+    char *conn_name = nullptr; size_t conn_name_len = 0;
+
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_STRING_OR_NULL(conn_name, conn_name_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    php_kislayphp_migrations_t *obj = php_kislayphp_migrations_fetch_object(Z_OBJ_P(ZEND_THIS));
+    if (conn_name != nullptr && conn_name_len > 0) {
+        obj->connection_name.assign(conn_name, conn_name_len);
+        obj->has_connection_name = true;
+    } else {
+        obj->has_connection_name = false;
+    }
+}
+
+PHP_METHOD(KislayPersistenceMigrations, add) {
+    char *id = nullptr; size_t id_len = 0;
+    char *sql = nullptr; size_t sql_len = 0;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_STRING(id, id_len)
+        Z_PARAM_STRING(sql, sql_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    php_kislayphp_migrations_t *obj = php_kislayphp_migrations_fetch_object(Z_OBJ_P(ZEND_THIS));
+    kislayphp_migration_entry entry;
+    entry.id.assign(id, id_len);
+    entry.sql.assign(sql, sql_len);
+    obj->migrations.push_back(std::move(entry));
+
+    RETURN_ZVAL(ZEND_THIS, 1, 0);
+}
+
+PHP_METHOD(KislayPersistenceMigrations, run) {
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    php_kislayphp_migrations_t *obj = php_kislayphp_migrations_fetch_object(Z_OBJ_P(ZEND_THIS));
+
+    zval pdo;
+    ZVAL_UNDEF(&pdo);
+    std::string error;
+    char *conn_name = obj->has_connection_name ? const_cast<char *>(obj->connection_name.c_str()) : nullptr;
+    size_t conn_name_len = obj->has_connection_name ? obj->connection_name.size() : 0;
+
+    if (!kislayphp_db_connection(conn_name, conn_name_len, &pdo, &error)) {
+        if (EG(exception) == nullptr) zend_throw_exception(zend_ce_exception, error.c_str(), 0);
+        RETURN_FALSE;
+    }
+
+    if (!kislayphp_migrations_ensure_table(&pdo, &error)) {
+        zval_ptr_dtor(&pdo);
+        if (EG(exception) == nullptr) zend_throw_exception(zend_ce_exception, error.c_str(), 0);
+        RETURN_FALSE;
+    }
+
+    zval run_arr, skipped_arr;
+    array_init(&run_arr);
+    array_init(&skipped_arr);
+
+    for (const auto &migration : obj->migrations) {
+        const char *check_sql = "SELECT id FROM _kislay_migrations WHERE id = ?";
+        zval check_bindings;
+        array_init(&check_bindings);
+        add_next_index_string(&check_bindings, migration.id.c_str());
+
+        zval check_stmt;
+        if (!kislayphp_pdo_prepare_execute(&pdo, check_sql, std::strlen(check_sql), &check_bindings, &check_stmt, &error)) {
+            zval_ptr_dtor(&check_bindings);
+            if (EG(exception) == nullptr) zend_throw_exception(zend_ce_exception, error.c_str(), 0);
+            zval_ptr_dtor(&run_arr);
+            zval_ptr_dtor(&skipped_arr);
+            zval_ptr_dtor(&pdo);
+            RETURN_FALSE;
+        }
+        zval_ptr_dtor(&check_bindings);
+
+        zval fetch_ret;
+        ZVAL_UNDEF(&fetch_ret);
+        zend_call_method_with_0_params(Z_OBJ(check_stmt), Z_OBJCE(check_stmt), nullptr, "fetch", &fetch_ret);
+        zval_ptr_dtor(&check_stmt);
+
+        bool already_run = (Z_TYPE(fetch_ret) == IS_ARRAY);
+        zval_ptr_dtor(&fetch_ret);
+
+        if (already_run) {
+            add_next_index_string(&skipped_arr, migration.id.c_str());
+            continue;
+        }
+
+        zval exec_sql;
+        ZVAL_STRINGL(&exec_sql, migration.sql.c_str(), migration.sql.size());
+        zval exec_ret;
+        ZVAL_UNDEF(&exec_ret);
+        zend_call_method_with_1_params(Z_OBJ(pdo), Z_OBJCE(pdo), nullptr, "exec", &exec_ret, &exec_sql);
+        zval_ptr_dtor(&exec_sql);
+
+        if (EG(exception) != nullptr || Z_TYPE(exec_ret) == IS_FALSE) {
+            if (EG(exception) == nullptr) {
+                zend_throw_exception(zend_ce_exception,
+                    ("Migration [" + migration.id + "] failed to execute").c_str(), 0);
+            }
+            zval_ptr_dtor(&exec_ret);
+            zval_ptr_dtor(&run_arr);
+            zval_ptr_dtor(&skipped_arr);
+            zval_ptr_dtor(&pdo);
+            RETURN_FALSE;
+        }
+        zval_ptr_dtor(&exec_ret);
+
+        const char *record_sql = "INSERT INTO _kislay_migrations (id) VALUES (?)";
+        zval record_bindings;
+        array_init(&record_bindings);
+        add_next_index_string(&record_bindings, migration.id.c_str());
+
+        zval record_stmt;
+        if (!kislayphp_pdo_prepare_execute(&pdo, record_sql, std::strlen(record_sql), &record_bindings, &record_stmt, &error)) {
+            zval_ptr_dtor(&record_bindings);
+            if (EG(exception) == nullptr) zend_throw_exception(zend_ce_exception, error.c_str(), 0);
+            zval_ptr_dtor(&run_arr);
+            zval_ptr_dtor(&skipped_arr);
+            zval_ptr_dtor(&pdo);
+            RETURN_FALSE;
+        }
+        zval_ptr_dtor(&record_bindings);
+        zval_ptr_dtor(&record_stmt);
+
+        add_next_index_string(&run_arr, migration.id.c_str());
+    }
+
+    zval_ptr_dtor(&pdo);
+
+    array_init(return_value);
+    add_assoc_zval(return_value, "run", &run_arr);
+    add_assoc_zval(return_value, "skipped", &skipped_arr);
+}
+
+PHP_METHOD(KislayPersistenceMigrations, status) {
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    php_kislayphp_migrations_t *obj = php_kislayphp_migrations_fetch_object(Z_OBJ_P(ZEND_THIS));
+
+    zval pdo;
+    ZVAL_UNDEF(&pdo);
+    std::string error;
+    char *conn_name = obj->has_connection_name ? const_cast<char *>(obj->connection_name.c_str()) : nullptr;
+    size_t conn_name_len = obj->has_connection_name ? obj->connection_name.size() : 0;
+
+    if (!kislayphp_db_connection(conn_name, conn_name_len, &pdo, &error)) {
+        if (EG(exception) == nullptr) zend_throw_exception(zend_ce_exception, error.c_str(), 0);
+        RETURN_FALSE;
+    }
+
+    if (!kislayphp_migrations_ensure_table(&pdo, &error)) {
+        zval_ptr_dtor(&pdo);
+        if (EG(exception) == nullptr) zend_throw_exception(zend_ce_exception, error.c_str(), 0);
+        RETURN_FALSE;
+    }
+
+    const char *all_sql = "SELECT id, run_at FROM _kislay_migrations";
+    zval sql_zv, all_stmt;
+    ZVAL_STRING(&sql_zv, all_sql);
+    ZVAL_UNDEF(&all_stmt);
+    zend_call_method_with_1_params(Z_OBJ(pdo), Z_OBJCE(pdo), nullptr, "query", &all_stmt, &sql_zv);
+    zval_ptr_dtor(&sql_zv);
+    zval_ptr_dtor(&pdo);
+
+    std::unordered_map<std::string, std::string> run_records;
+
+    if (!EG(exception) && Z_TYPE(all_stmt) != IS_FALSE && Z_TYPE(all_stmt) != IS_UNDEF) {
+        zval fetch_mode;
+        ZVAL_LONG(&fetch_mode, 2); // PDO::FETCH_ASSOC
+        zval rows;
+        ZVAL_UNDEF(&rows);
+        zend_call_method_with_1_params(Z_OBJ(all_stmt), Z_OBJCE(all_stmt), nullptr, "fetchAll", &rows, &fetch_mode);
+        zval_ptr_dtor(&all_stmt);
+
+        if (!EG(exception) && Z_TYPE(rows) == IS_ARRAY) {
+            zval *row;
+            ZEND_HASH_FOREACH_VAL(Z_ARRVAL(rows), row) {
+                if (Z_TYPE_P(row) == IS_ARRAY) {
+                    zval *id_zv   = zend_hash_str_find(Z_ARRVAL_P(row), "id",     sizeof("id")     - 1);
+                    zval *rat_zv  = zend_hash_str_find(Z_ARRVAL_P(row), "run_at", sizeof("run_at") - 1);
+                    if (id_zv != nullptr) {
+                        std::string id_s  = kislayphp_zval_to_string(id_zv,  "");
+                        std::string rat_s = kislayphp_zval_to_string(rat_zv, "");
+                        if (!id_s.empty()) {
+                            run_records[id_s] = rat_s;
+                        }
+                    }
+                }
+            } ZEND_HASH_FOREACH_END();
+        }
+        zval_ptr_dtor(&rows);
+    } else {
+        if (EG(exception)) zend_clear_exception();
+        zval_ptr_dtor(&all_stmt);
+    }
+
+    array_init(return_value);
+    for (const auto &migration : obj->migrations) {
+        zval entry;
+        array_init(&entry);
+        add_assoc_string(&entry, "id",  migration.id.c_str());
+        add_assoc_string(&entry, "sql", migration.sql.c_str());
+        auto it = run_records.find(migration.id);
+        if (it != run_records.end()) {
+            add_assoc_string(&entry, "run_at", it->second.c_str());
+        } else {
+            add_assoc_null(&entry, "run_at");
+        }
+        add_next_index_zval(return_value, &entry);
+    }
+}
+
 PHP_METHOD(KislayPersistenceEloquent, boot) {
     zval *config = nullptr;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -1201,6 +1755,12 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_persistence_void, 0, 0, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_persistence_hook_callback, 0, 0, 0)
+    ZEND_ARG_INFO(0, arg1)
+    ZEND_ARG_INFO(0, arg2)
+    ZEND_ARG_INFO(0, arg3)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_persistence_cache_put, 0, 0, 3)
     ZEND_ARG_TYPE_INFO(0, pool, IS_STRING, 0)
     ZEND_ARG_TYPE_INFO(0, key, IS_STRING, 0)
@@ -1240,13 +1800,38 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_persistence_db_transaction, 0, 0, 1)
     ZEND_ARG_CALLABLE_INFO(0, callback, 0)
     ZEND_ARG_TYPE_INFO(0, connection, IS_STRING, 1)
 ZEND_END_ARG_INFO()
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_kislayphp_persistence_db_ping, 0, 0, _IS_BOOL, 0)
+    ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 1)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_kislayphp_persistence_db_select, 0, 1, IS_ARRAY, 0)
+    ZEND_ARG_TYPE_INFO(0, sql, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, bindings, IS_ARRAY, 1)
+    ZEND_ARG_TYPE_INFO(0, connection, IS_STRING, 1)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_kislayphp_persistence_db_mutate, 0, 1, IS_LONG, 0)
+    ZEND_ARG_TYPE_INFO(0, sql, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, bindings, IS_ARRAY, 1)
+    ZEND_ARG_TYPE_INFO(0, connection, IS_STRING, 1)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_migrations_construct, 0, 0, 0)
+    ZEND_ARG_TYPE_INFO(0, connectionName, IS_STRING, 1)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_migrations_add, 0, 0, 2)
+    ZEND_ARG_TYPE_INFO(0, id, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, sql, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
 
 static const zend_function_entry kislayphp_persistence_runtime_methods[] = {
     PHP_ME(KislayPersistenceRuntime, attach, arginfo_kislayphp_persistence_attach, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_ME(KislayPersistenceRuntime, track, arginfo_kislayphp_persistence_track, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_ME(KislayPersistenceRuntime, transaction, arginfo_kislayphp_persistence_transaction_runtime, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(KislayPersistenceRuntime, beginRequest, arginfo_kislayphp_persistence_void, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(KislayPersistenceRuntime, cleanup, arginfo_kislayphp_persistence_void, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(KislayPersistenceRuntime, beginRequest, arginfo_kislayphp_persistence_hook_callback, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(KislayPersistenceRuntime, cleanup, arginfo_kislayphp_persistence_hook_callback, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_ME(KislayPersistenceRuntime, cachePut, arginfo_kislayphp_persistence_cache_put, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_ME(KislayPersistenceRuntime, cacheGet, arginfo_kislayphp_persistence_cache_get, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_ME(KislayPersistenceRuntime, cacheForget, arginfo_kislayphp_persistence_cache_forget, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
@@ -1262,6 +1847,11 @@ static const zend_function_entry kislayphp_persistence_db_methods[] = {
     PHP_ME(KislayPersistenceDB, transaction, arginfo_kislayphp_persistence_db_transaction, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_ME(KislayPersistenceDB, attach, arginfo_kislayphp_persistence_attach, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_ME(KislayPersistenceDB, cleanup, arginfo_kislayphp_persistence_void, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(KislayPersistenceDB, ping,    arginfo_kislayphp_persistence_db_ping,   ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(KislayPersistenceDB, select,  arginfo_kislayphp_persistence_db_select, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(KislayPersistenceDB, insert,  arginfo_kislayphp_persistence_db_mutate, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(KislayPersistenceDB, update,  arginfo_kislayphp_persistence_db_mutate, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(KislayPersistenceDB, delete,  arginfo_kislayphp_persistence_db_mutate, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_FE_END
 };
 
@@ -1270,6 +1860,14 @@ static const zend_function_entry kislayphp_persistence_eloquent_methods[] = {
     PHP_ME(KislayPersistenceEloquent, connection, arginfo_kislayphp_persistence_db_connection, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_ME(KislayPersistenceEloquent, transaction, arginfo_kislayphp_persistence_db_transaction, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_ME(KislayPersistenceEloquent, attach, arginfo_kislayphp_persistence_attach, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_FE_END
+};
+
+static const zend_function_entry kislayphp_persistence_migrations_methods[] = {
+    PHP_ME(KislayPersistenceMigrations, __construct, arginfo_kislayphp_migrations_construct, ZEND_ACC_PUBLIC)
+    PHP_ME(KislayPersistenceMigrations, add,         arginfo_kislayphp_migrations_add,        ZEND_ACC_PUBLIC)
+    PHP_ME(KislayPersistenceMigrations, run,         arginfo_kislayphp_persistence_void,      ZEND_ACC_PUBLIC)
+    PHP_ME(KislayPersistenceMigrations, status,      arginfo_kislayphp_persistence_void,      ZEND_ACC_PUBLIC)
     PHP_FE_END
 };
 
@@ -1285,9 +1883,17 @@ PHP_MINIT_FUNCTION(kislayphp_persistence) {
     INIT_NS_CLASS_ENTRY(ce, "Kislay\\Persistence", "Eloquent", kislayphp_persistence_eloquent_methods);
     kislayphp_persistence_eloquent_ce = zend_register_internal_class(&ce);
 
+    INIT_NS_CLASS_ENTRY(ce, "Kislay\\Persistence", "Migrations", kislayphp_persistence_migrations_methods);
+    kislayphp_persistence_migrations_ce = zend_register_internal_class(&ce);
+    kislayphp_persistence_migrations_ce->create_object = kislayphp_migrations_create_object;
+    memcpy(&kislayphp_migrations_object_handlers, zend_get_std_object_handlers(), sizeof(zend_object_handlers));
+    kislayphp_migrations_object_handlers.offset = offsetof(php_kislayphp_migrations_t, std);
+    kislayphp_migrations_object_handlers.free_obj = kislayphp_migrations_free_object;
+
     zend_register_class_alias("KislayPHP\\Persistence\\Runtime", kislayphp_persistence_runtime_ce);
     zend_register_class_alias("KislayPHP\\Persistence\\DB", kislayphp_persistence_db_ce);
     zend_register_class_alias("KislayPHP\\Persistence\\Eloquent", kislayphp_persistence_eloquent_ce);
+    zend_register_class_alias("KislayPHP\\Persistence\\Migrations", kislayphp_persistence_migrations_ce);
 
     return SUCCESS;
 }
